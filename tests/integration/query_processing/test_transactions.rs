@@ -1636,6 +1636,136 @@ fn test_insert_or_fail_keeps_prior_changes(tmp_db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_upsert_or_fail_preserves_indexes_after_update_unique_violation(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, b INT, c INT UNIQUE)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_b ON t(b)").unwrap();
+    conn.execute("INSERT INTO t VALUES(1,1,10,10)").unwrap();
+    conn.execute("INSERT INTO t VALUES(2,2,20,20)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    let result = conn.execute(
+        "INSERT OR FAIL INTO t VALUES(3,1,30,30) \
+         ON CONFLICT(u) DO UPDATE SET b=99,c=20",
+    );
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    conn.execute("COMMIT").unwrap();
+
+    let stmt = conn.query("PRAGMA integrity_check").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(rows, vec![vec![Value::Text("ok".into())]]);
+
+    let stmt = conn
+        .query("SELECT id,u,b,c FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::from_i64(1),
+                Value::from_i64(1),
+                Value::from_i64(10),
+                Value::from_i64(10),
+            ],
+            vec![
+                Value::from_i64(2),
+                Value::from_i64(2),
+                Value::from_i64(20),
+                Value::from_i64(20),
+            ],
+        ]
+    );
+}
+
+#[turso_macros::test]
+fn test_upsert_or_fail_preserves_expression_index_after_new_key_error(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b INT)")
+        .unwrap();
+    conn.execute(
+        "CREATE INDEX idx ON t( \
+           CASE \
+             WHEN b=2 THEN 'x' LIKE 'x' ESCAPE 'yy' \
+             ELSE b \
+           END \
+         )",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t VALUES(1,1)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    let result = conn.execute(
+        "INSERT OR FAIL INTO t(id,b) VALUES(1,2) \
+         ON CONFLICT(id) DO UPDATE SET b=excluded.b",
+    );
+    assert!(result.is_err());
+    conn.execute("COMMIT").unwrap();
+
+    let stmt = conn.query("PRAGMA integrity_check").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(rows, vec![vec![Value::Text("ok".into())]]);
+
+    let stmt = conn
+        .query("SELECT id,b FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::from_i64(1)]]);
+}
+
+#[turso_macros::test]
+fn test_upsert_or_fail_preserves_indexes_after_rowid_update_conflict(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, a TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX ia ON t(a)").unwrap();
+    conn.execute("INSERT INTO t VALUES(1,1,'victim')").unwrap();
+    conn.execute("INSERT INTO t VALUES(2,2,'other')").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    let result = conn.execute(
+        "INSERT OR FAIL INTO t(id,u,a) VALUES(99,1,'x') \
+         ON CONFLICT(u) DO UPDATE SET id=2, a='new'",
+    );
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    conn.execute("COMMIT").unwrap();
+
+    let stmt = conn.query("PRAGMA integrity_check").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(rows, vec![vec![Value::Text("ok".into())]]);
+
+    let stmt = conn
+        .query("SELECT id,u,a FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::from_i64(1),
+                Value::from_i64(1),
+                Value::Text("victim".into()),
+            ],
+            vec![
+                Value::from_i64(2),
+                Value::from_i64(2),
+                Value::Text("other".into()),
+            ],
+        ]
+    );
+}
+
+#[turso_macros::test]
 /// INSERT OR ABORT (default) should rollback all changes from the statement on error.
 fn test_insert_or_abort_rolls_back_statement(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
